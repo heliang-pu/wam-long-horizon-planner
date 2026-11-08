@@ -1,0 +1,10 @@
+# Data building, forward kinematics, the long-horizon runtime and the unit tests.
+numpy
+pandas
+pyarrow
+av
+pillow
+pyyaml
+torch
+pytest
+pyAgxArm  # PiPER forward kinematics (scripts/sim2real/ee_pose.py, success_moments.py); from AgileX

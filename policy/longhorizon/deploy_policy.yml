@@ -1,0 +1,61 @@
+# Long-horizon meta adapter (simulator: scripts/eval_policy.py --config policy/longhorizon/deploy_policy.yml).
+# run_real reads the long_horizon_* keys too (run_real --long_horizon wraps its --policy adapter); --overrides wins.
+#
+# A simulator scene holds one task, so a simulated chain is one task long: it checks the plumbing and the detector,
+# not the chaining. The chains themselves run on the bench (README).
+
+policy_name: longhorizon
+task_name: click_bell
+setting: clear
+model_name: longhorizon
+seed: 0
+max_episodes: 1
+max_steps: 1000
+headless: true
+device: cpu
+renderer: hybrid
+gpu_id: 0
+num_envs: 1
+filter_dataset_saving: true
+eval_video_log: false
+eval_video_obs_key: cam_high
+
+# The world action model that runs every subtask; its <inner>_* settings and checkpoint_dir come from
+# policy/<inner>/deploy_policy.yml unless set here or in --overrides.
+inner_policy: phoenix
+checkpoint_dir: ""
+
+# The subtasks in order (a list, or "a,b,c"); empty = task_name alone.
+long_horizon_tasks: []
+# A train_done_detector.py output dir (head.pt, config.json, and features.json or encoder.pt); empty = no detector: a
+# subtask ends only by request_next (run_real: n) or long_horizon_max_steps. A detector on Phoenix's own features
+# (source phoenix) needs inner_policy phoenix with the checkpoint and prompts its features were extracted with; the
+# worker is then started through phoenix_tap_worker (phoenix_python) and hands over one feature per chunk.
+long_horizon_detector: ""
+long_horizon_device: auto  # the detector's torch device (auto = cuda if there is one)
+# null = each task's threshold chosen on validation (the detector's config.json); a number = that for every task.
+long_horizon_threshold: null
+long_horizon_confirm: 2  # detector frames in a row at or above the threshold (2 frames = 1 s at 2 frames per second)
+long_horizon_min_steps: 30  # no switch in a subtask's first steps
+long_horizon_max_steps: 1000  # policy steps per subtask (0 = no limit), then long_horizon_on_timeout
+long_horizon_on_timeout: next  # next: give the subtask up, go on; stop: end the chain (hold the start pose)
+# Between subtasks the arms go back to the pose the episode started from (as every training episode starts), at most
+# home_rad_per_step per step for the arm joints, grippers alongside, then hold it settle_steps steps.
+long_horizon_return_home: true
+long_horizon_home_rad_per_step: 0.05
+long_horizon_home_steps_per_call: 10
+long_horizon_settle_steps: 5
+long_horizon_control_hz: 10  # env steps per second: the detector sees every control_hz / fps-th step
+long_horizon_gripper_scale: 0.05  # start-pose grippers (opening fraction) -> the env's metres per finger
+# Per subtask: a prompt other than the adapter's trained one, and adapter settings (e.g. {click_bell: {phoenix_steps:
+# 10}}). Prompt and live-settable steps switch on the loaded model; anything else builds it again.
+long_horizon_prompts: {}
+long_horizon_task_overrides: {}
+
+# Planner mode (π0.5-style high level, MEM-style memory): instead of long_horizon_tasks in a fixed order, one sentence,
+# and a vision-language model picks the skills (planner_worker.py; RynnBrain1.1-2B, venvs/planner). Both or neither.
+long_horizon_goal: ""  # e.g. 先按铃，再把笔放进笔筒，最后倒水
+long_horizon_planner: ""  # a train_planner.py adapter dir, or base (zero-shot)
+long_horizon_planner_confirm: 2  # replies in a row naming another skill before the running one ends
+long_horizon_planner_python: ""  # default $LONGHORIZON_PLANNER_PYTHON, else WS_ROOT/venvs/planner
+long_horizon_planner_cuda_visible_devices: ""  # default the adapter's GPU

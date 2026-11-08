@@ -1,0 +1,15 @@
+# The planner's venv (training, evaluation, planner_worker.py); setup_planner_env.sh installs exactly this.
+--find-links https://download.pytorch.org/whl/cu128
+torch==2.7.1+cu128
+torchvision==0.22.1+cu128
+transformers==5.20.2
+flash-linear-attention
+peft
+accelerate
+pillow
+av
+pandas
+pyarrow
+numpy
+pyyaml
+pytest

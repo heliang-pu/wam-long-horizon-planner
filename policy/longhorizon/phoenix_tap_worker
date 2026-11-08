@@ -1,0 +1,6 @@
+#!/bin/sh
+# phoenix_python of policy/phoenix's adapter while policy/longhorizon's done detector reads Phoenix's own features
+# (long_horizon.py sets it): the adapter runs "<this> phoenix_worker.py <args>", and this runs that phoenix_worker.py
+# under Phoenix's interpreter ($LONGHORIZON_WAM_PYTHON) through wam_features.py, which writes the features of every
+# inference to $LONGHORIZON_FEATURES_OUT. The worker itself, its protocol and its actions are unchanged.
+exec "${LONGHORIZON_WAM_PYTHON:?set by policy/longhorizon/long_horizon.py}" "$(dirname "$0")/wam_features.py" worker "$@"

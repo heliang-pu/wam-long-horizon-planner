@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.ruff_cache/
+.pytest_cache/
+# data and weights live outside the repository
+Real
+real_rollouts
+audit_reports/
+out/
+*.safetensors
+*.pt
+*.npz
