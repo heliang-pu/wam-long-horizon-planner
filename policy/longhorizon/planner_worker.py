@@ -50,16 +50,17 @@ def main() -> None:
                 reply = {"ok": True, "info": planner.info()}
             elif request["cmd"] == "plan":
                 with np.load(request["images_path"]) as data:
-                    images = [planner_image(data[f"image_{k}"]) for k in range(6)]
+                    images = [planner_image(data[f"image_{k}"]) for k in range(len(data.files))]
                 skills = tuple(request.get("skills") or ())
-                skill, memory, text, took = planner.plan(
+                result = planner.plan_scored(
                     images,
                     request["goal"],
                     request.get("running"),
                     request["memory"],
                     **({"skills": skills} if skills else {}),
                 )
-                reply = {"ok": True, "skill": skill, "memory": memory, "reply": text, "infer_s": took}
+                reply = {"ok": True, "skill": result["skill"], "memory": result["memory"], "reply": result["reply"],
+                         "infer_s": result["seconds"], "probs": result["probs"]}  # fmt: skip
             else:
                 raise ValueError(f"unknown cmd {request['cmd']!r}")
         except Exception as exc:  # report and keep serving; the client raises it

@@ -1097,3 +1097,73 @@ def test_training_batches_pad_rows_and_concatenate_images():
     assert batch["labels"].tolist() == [[-100, 2, 3], [5, -100, -100]]
     assert batch["pixel_values"].shape == (12, 2) and batch["pixel_values"][4:].sum() == 16
     assert batch["image_grid_thw"].tolist() == [[1, 2, 2], [1, 2, 4]]
+
+
+def test_runtime_threshold_switches_on_the_running_skills_probability(monkeypatch):
+    calls = {"n": 0}
+
+    def reply(running, memory, call):
+        return ("click_bell" if running is None else running), memory
+
+    monkeypatch.setattr(FakePlanner, "plan", lambda self, images, goal, running, memory: {
+        "skill": running or "click_bell", "memory": memory, "reply": "", "infer_s": 0.01,
+        "probs": None if running is None else {"click_bell": 0.6, "water_pouring": 0.35, "done": 0.05}})  # fmt: skip
+    model, _policy, _planner = planner_model(monkeypatch, reply, planner_threshold=0.8)
+    env = FakeEnv()
+    obs = run(model, env, env.reset(), 1)
+    run(model, env, obs, 4)  # the greedy reply always keeps the bell; p 0.6 < 0.8 votes for water each time
+    assert model.records[0]["reason"] == "planner" and model.records[0]["next"] == "water_pouring"
+    assert any(p.get("greedy") == "click_bell" and p["skill"] == "water_pouring" for p in model.records[0]["plans"])
+
+
+def test_goal_and_planner_change_without_a_restart_from_the_next_episode(monkeypatch):
+    """The web console's 长任务 tab changes the goal and the planner while the world model stays loaded: both are taken
+    at the next episode's start (the planner loads in the background meanwhile, the running one goes on); a recorder
+    writes the running skill's prompt per frame, HOME_PROMPT on the way home."""
+    import time
+
+    def reply(running, memory, call):
+        return ("click_bell", memory) if running is None else (running, memory)
+
+    model, _policy, planner = planner_model(monkeypatch, reply)
+    env = FakeEnv()
+    obs = run(model, env, env.reset(), 1)
+    assert model.frame_prompt() == "Click the bell"
+    model.set_goal("先倒水")
+    model.set_planner("other_adapter")
+    deadline = time.monotonic() + 5
+    while model.planner_loading and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert model.pending_planner[0] == "other_adapter"
+    assert model.planner is planner  # this episode keeps its planner and goal
+    assert model.settings.goal == "先按铃，再倒水"
+    model.request_next()
+    obs = run(model, env, obs, 1)
+    assert model.phase == "home"
+    assert model.frame_prompt() == lh.HOME_PROMPT
+    run(model, env, env.reset(), 1)  # the next episode
+    new = FakePlanner.instances[-1]
+    assert model.settings.goal == "先倒水"
+    assert model.settings.planner == "other_adapter"
+    assert model.planner is new
+    assert planner.closed
+    assert new.calls[0]["goal"] == "先倒水"
+    model.close_planners()
+    assert new.closed
+    assert model.planner is None
+
+
+def test_each_skill_start_tells_on_skill_its_task(monkeypatch):
+    """run_real's console sets each skill's own gripper settings through on_skill (water 0.7, mixer 0.82, ...)."""
+
+    def reply(running, memory, call):
+        if running is None:
+            return ("click_bell", memory) if memory == pp.NO_MEMORY else ("water_pouring", memory)
+        return ("water_pouring", "已完成：按铃。") if running == "click_bell" and call >= 2 else (running, memory)
+
+    model, _policy, _planner = planner_model(monkeypatch, reply, planner_confirm=1)
+    started = []
+    model.on_skill = started.append
+    env = FakeEnv()
+    run(model, env, env.reset(), 8)
+    assert started[:2] == ["click_bell", "water_pouring"]

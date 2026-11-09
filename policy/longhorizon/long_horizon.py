@@ -65,6 +65,9 @@ ON_TIMEOUT = ("next", "stop")
 PROMPT_KEYS = ("task_name", "prompt")
 
 
+HOME_PROMPT = "return both arms to the start pose"  # the recorded task of the frames between two skills
+
+
 @dataclasses.dataclass
 class Settings:
     """long_horizon_* keys of deploy_policy.yml / --overrides (see policy/longhorizon/deploy_policy.yml)."""
@@ -89,6 +92,10 @@ class Settings:
     planner: str = ""  # a train_planner.py adapter dir, or base (RynnBrain1.1-2B zero-shot)
     planner_confirm: int = 2  # planner replies in a row naming another skill before the running one ends
     planner_every_s: float = 3.0  # at least this long between planner asks (0: after every chunk); evaluated at 3 s
+    # > 0: a reply votes to switch when the running skill's probability (planner_runtime.plan_scored) is below this,
+    # to the likeliest other skill, whatever the greedy reply says; 0: the greedy reply (eval_planner.py --threshold)
+    planner_threshold: float = 0.0
+    stop_when_finished: bool = False  # the simulator: end the episode (truncated) once the goal is finished
     planner_python: str = ""  # default $LONGHORIZON_PLANNER_PYTHON, else WS_ROOT/venvs/planner
     planner_cuda_visible_devices: str = ""  # default the adapter's gpu_id
 
@@ -190,11 +197,11 @@ class LongHorizonModel:
         self.index = 0
         self.inner, self.inner_args = None, None
         self.inner = self._build(self.task_args(settings.tasks[0]))
+        self.pending_goal, self.pending_planner, self.planner_loading = None, None, None  # taken at an episode's start
+        self.planner_error = None
+        self.on_skill = None  # (task) -> None at each skill's start: run_real's console sets that task's gripper
         if settings.goal:
-            gpu = settings.planner_cuda_visible_devices or str(usr_args.get(f"{self.name}_cuda_visible_devices",
-                                                                            usr_args.get("gpu_id", 0)))  # fmt: skip
-            self.planner = PlannerClient(settings.planner, python=settings.planner_python or None,
-                                         cuda_visible_devices=gpu, skills=settings.tasks)  # fmt: skip
+            self.planner = self._new_planner(settings.planner)
         # a memory planner (train_planner.py --progress): the memory also keeps the running skill's progress, built
         # from every reply (planner_prompt.MemoryTracker); otherwise it changes only when a skill ends
         self.uses_progress = bool(
@@ -215,6 +222,70 @@ class LongHorizonModel:
             detector = settings.detector or "none (subtasks end by request_next or max_steps only)"
             rate = "one per chunk (Phoenix's features)" if self.features_path else f"every {self.stride} steps"
             print(f"[long_horizon] {self.name}: {chain}; detector {detector}, {rate}", flush=True)
+
+    def _new_planner(self, adapter: str) -> PlannerClient:
+        gpu = self.settings.planner_cuda_visible_devices or str(
+            self.base_args.get(f"{self.name}_cuda_visible_devices", self.base_args.get("gpu_id", 0))
+        )
+        return PlannerClient(adapter, python=self.settings.planner_python or None, cuda_visible_devices=gpu,
+                             skills=self.settings.tasks)  # fmt: skip
+
+    def frame_prompt(self) -> str:
+        """The task string a recorder writes for the step now: the running skill's prompt, or HOME_PROMPT while the
+        arms go back to (or hold) the start pose between skills."""
+        if getattr(self, "phase", None) == "run" and self.inner_args:
+            return str(self.inner_args.get("prompt") or self.settings.goal)
+        return HOME_PROMPT
+
+    def set_goal(self, goal: str) -> None:
+        """Another goal sentence (the web console's 长任务 tab, no restart): taken at the next episode's start."""
+        if not self.settings.goal:
+            raise ValueError("not a planner chain (--goal)")
+        self.pending_goal = str(goal)
+
+    def set_planner(self, adapter: str) -> None:
+        """Another planner adapter (no restart, the world model stays): its worker starts in the background and replaces
+        the running one at the next episode's start; until then the running one goes on."""
+        if not self.settings.goal:
+            raise ValueError("not a planner chain (--goal)")
+        if self.planner_loading:
+            raise ValueError(f"a planner is still loading ({self.planner_loading})")
+        self.planner_loading = str(adapter)
+
+        def load() -> None:
+            try:
+                self.pending_planner = (str(adapter), self._new_planner(str(adapter)))
+            except Exception as exc:  # noqa: BLE001 - shown on the page, the running planner stays
+                print(f"[long_horizon] planner {adapter} did not start: {exc}", flush=True)
+                self.planner_error = f"{adapter}: {exc}"
+            finally:
+                self.planner_loading = None
+
+        self.planner_error = None
+        threading.Thread(target=load, name="planner-load", daemon=True).start()
+
+    def close_planners(self) -> None:
+        """The planner workers (the running one and one loaded for the next episode) give their GPU memory back."""
+        pending, self.pending_planner = self.pending_planner, None
+        for planner in (self.planner, pending[1] if pending else None):
+            if planner is not None:
+                planner.close()
+        self.planner = None
+
+    def _take_pending(self) -> None:
+        """An episode starts: the goal and planner chosen since the one before (set_goal, set_planner)."""
+        if self.pending_goal is not None:
+            self.settings.goal, self.pending_goal = self.pending_goal, None
+            print(f"[long_horizon] goal now {self.settings.goal!r}", flush=True)
+        if self.pending_planner is not None:
+            (adapter, planner), self.pending_planner = self.pending_planner, None
+            old, self.planner, self.settings.planner = self.planner, planner, adapter
+            info = getattr(planner, "info", None) or {}
+            self.uses_progress = bool(info.get("progress"))
+            self.top_frames = FrameMemory(self.settings.control_hz, past=info.get("past_s") or pp.PAST_S)
+            if old is not None:
+                old.close()
+            print(f"[long_horizon] planner now {adapter}", flush=True)
 
     def _tap_phoenix(self) -> None:
         """Phoenix's own features: its adapter starts the worker through phoenix_tap_worker (phoenix_python, an adapter
@@ -378,6 +449,7 @@ class LongHorizonModel:
                 self._switch(0)
             self._begin_subtask(obs)
             return
+        self._take_pending()
         self.mem = pp.MemoryTracker(progress=self.uses_progress)
         self.memory, self.finished, self.plans = self.mem.text(), self.mem.finished, []
         self.pending_plan = None
@@ -391,8 +463,11 @@ class LongHorizonModel:
         return [images[cam] for cam in CAMERAS] + self.top_frames.past(self.episode_steps, images["cam_high"])
 
     def _log_plan(self, result: dict, running: str | None) -> None:
+        probs = result.get("probs") or {}
         self.plans.append({"step": self.episode_steps, "running": running, "skill": result["skill"],
-                           "memory": result["memory"], "ms": round(1000 * result["infer_s"])})  # fmt: skip
+                           "memory": result["memory"], "ms": round(1000 * result["infer_s"]),
+                           **({"p_run": round(probs[running], 4)} if running in probs else {}),
+                           **({"greedy": result["greedy_skill"]} if "greedy_skill" in result else {})})  # fmt: skip
 
     def _choose_next(self, obs) -> None:
         """Ask the planner what to do, nothing running (the episode's start, or after n / a timeout); start it."""
@@ -418,7 +493,7 @@ class LongHorizonModel:
         future, decision = self.pending_plan, None
         if future is not None and future.done():
             self.pending_plan = None
-            result = future.result()  # a worker error surfaces here
+            result = self._thresholded(future.result())  # a worker error surfaces here
             self._log_plan(result, self.task)
             if self.uses_progress:
                 self.mem.observe(result["memory"])
@@ -436,6 +511,17 @@ class LongHorizonModel:
                 self._planner_images(obs), self.settings.goal, self.task, self.memory
             )
         return decision
+
+    def _thresholded(self, result: dict) -> dict:
+        """The reply with its skill decided by planner_threshold on the running skill's probability (if set and the
+        worker sent the probabilities); the greedy skill is kept as greedy_skill."""
+        threshold, probs = float(self.settings.planner_threshold), result.get("probs")
+        if threshold <= 0 or not probs or self.task not in probs:
+            return result
+        p_run = probs[self.task]
+        other = max((name for name in probs if name != self.task), key=probs.get)
+        skill = self.task if p_run >= threshold else other
+        return {**result, "skill": skill, "greedy_skill": result["skill"], "p_run": round(p_run, 4)}
 
     def _begin_subtask(self, obs) -> None:
         self.phase = "run"
@@ -457,6 +543,11 @@ class LongHorizonModel:
                 "start_step": self.episode_steps,
             }
         )
+        if self.on_skill is not None:
+            try:
+                self.on_skill(self.task)
+            except Exception as exc:  # noqa: BLE001 - the chain goes on with the settings it had
+                print(f"[long_horizon] on_skill({self.task}) failed: {exc}", flush=True)
         if self.tracker is not None and self.features_path is None:
             self.pending.append((*frame_of(obs), 0.0))
         if self.features_path is not None:  # the worker's count so far: the next inference is this subtask's
@@ -614,6 +705,8 @@ class LongHorizonModel:
             obs, info, truncated = self._drive_home(env, obs)
         elif self.phase == "finished":
             obs, info, truncated = self._hold(env, obs)
+            if self.settings.stop_when_finished:
+                truncated = True
         else:
             tap = StepTap(env, self, self.inner_args["prompt"])
             chunk = (qpos_of(obs), self.subtask_steps, self._stall_changes())
@@ -656,8 +749,7 @@ class LongHorizonModel:
 
     def close(self) -> None:
         self._close_inner()
-        if self.planner is not None:
-            self.planner.close()
+        self.close_planners()
         if self.features_path is not None:
             for name in (FEATURES_OUT, LAYERS_ENV, WAM_PYTHON):
                 os.environ.pop(name, None)
