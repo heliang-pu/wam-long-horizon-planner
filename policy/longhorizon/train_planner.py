@@ -72,16 +72,21 @@ class Samples(torch.utils.data.Dataset):
         else:
             images = [Image.open(self.data / path).convert("RGB") for path in s["images"]]
             state = None
-            if self.states is not None:  # dropped as a whole, so that the planner has to read the images too
+            if self.states is not None and s.get("episode"):  # dropped as a whole: the planner reads the images too
                 rng = random.Random(f"{self.seed}/{i}")
                 rows = self.states.get(s["episode"])
                 keep = rows is not None and rng.random() >= self.state_dropout
                 state = pp.hands_text(rows, s["frame"], rng) if keep else pp.STATE_UNKNOWN
-            inputs = encode_prompt(
-                self.processor, images, s["goal"], s["running"], s["memory"], state, progress=self.progress,
-                past=self.past,
-            )  # fmt: skip
-            reply = pp.target_text(s["target_skill"], s["target_memory"]) + "<|im_end|>"
+            if s.get("kind"):  # G5 (build_step_samples.py): a plan question (text only) or a step question
+                inputs = encode_prompt(self.processor, images, "", None, "",
+                                       text=pp.g5_prompt(s, state if s["kind"] == "step" else None, self.past))  # fmt: skip
+                reply = pp.g5_target(s) + "<|im_end|>"
+            else:
+                inputs = encode_prompt(
+                    self.processor, images, s["goal"], s["running"], s["memory"], state, progress=self.progress,
+                    past=self.past, listing=s.get("listing"),
+                )  # fmt: skip
+                reply = pp.target_text(s["target_skill"], s["target_memory"]) + "<|im_end|>"
         target = self.processor.tokenizer(reply, add_special_tokens=False, return_tensors="pt")["input_ids"]
         ids = torch.cat([inputs["input_ids"], target], 1)
         labels = torch.full_like(ids, -100)
@@ -133,6 +138,9 @@ def main() -> None:
     parser.add_argument("--state", action="store_true", help="the hands in the prompt (<data>/states.json)")
     parser.add_argument("--state-dropout", type=float, default=0.5, help="share of samples with the hands unknown")
     parser.add_argument("--progress", action="store_true", help="a memory planner (build_mem_samples.py samples)")
+    parser.add_argument("--listing", action="store_true", help="G4: samples with a skill list (build_list_samples.py)")
+    parser.add_argument("--hints", action="store_true", help="G4: the list lines carry done hints (build_list_samples --hints)")
+    parser.add_argument("--steps", action="store_true", help="G5: plan + step samples (build_step_samples.py)")
     parser.add_argument("--past", default="3,2,1", help="seconds before of the top-camera history images, as the "
                         "samples were built (build_mem_samples.py --past)")  # fmt: skip
     parser.add_argument("--format", choices=("ours", "lerobot"), default="ours", help="lerobot: LeRobot's planner "
@@ -180,8 +188,11 @@ def main() -> None:
         "data": str(data.resolve()),
         "prompt_version": up.version()
         if args.format == "lerobot"
-        else prompt_version(state=args.state, progress=args.progress, past=past),
+        else prompt_version(state=args.state, progress=args.progress, past=past, listing=args.listing, steps=args.steps),
         "format": args.format,
+        "list": args.listing,
+        "hints": args.hints,
+        "steps": args.steps,
         "past_s": list(past),
         "state": args.state,
         "progress": args.progress,

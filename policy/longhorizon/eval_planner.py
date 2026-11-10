@@ -195,20 +195,36 @@ def threshold_report(records: list[dict], episodes: dict, takeovers: dict, rate:
 CHAIN_LENGTHS = (2, 3, 4, 6, 10)
 
 
-def chain_specs(held: list[dict], seed: int, per_length: int, lengths=CHAIN_LENGTHS) -> list[dict]:
+def chain_specs(held: list[dict], seed: int, per_length: int, lengths=CHAIN_LENGTHS, goal_style: str = "named",
+                listing: bool = False, hints: bool = False) -> list[dict]:
     """Random goals of each length (any skills, repeats allowed, not twice in a row), each skill one held-out success
     episode of it; the same for every planner with the same seed."""
     rng = random.Random(f"{seed}/chains")
     pool = {t: [e["dir"] for e in held if e["task"] == t and e["success"] and 1 in e["labels"]] for t in pp.SKILLS}
     skills = [t for t in pp.SKILLS if pool[t]]
     specs = []
+    if goal_style == "count":  # G5: repeats in a row (按三次铃), goals with counts in held-out wordings; own stream
+        crng = random.Random(f"{seed}/count")
+        for length in lengths:
+            for _ in range(per_length):
+                chain = [crng.choice(skills)]
+                while len(chain) < length:
+                    chain.append(chain[-1] if crng.random() < 0.4 else crng.choice([t for t in skills if t != chain[-1]]))
+                specs.append({"chain": chain, "episodes": [crng.choice(pool[t]) for t in chain],
+                              "goal": pp.step_goal_text(chain, crng, split="eval", counted=0.85)})  # fmt: skip
+        return specs
     for length in lengths:
         for _ in range(per_length):
             chain = [rng.choice(skills)]
             while len(chain) < length:
                 chain.append(rng.choice([t for t in skills if t != chain[-1]]))
             specs.append({"chain": chain, "episodes": [rng.choice(pool[t]) for t in chain],
-                          "goal": pp.any_goal_text(chain, rng)})  # fmt: skip
+                          "goal": (pp.abstract_goal_text(chain, rng, split="eval", named_share=0.0)
+                                   if goal_style == "abstract" else pp.any_goal_text(chain, rng))})  # fmt: skip
+            if listing:  # G4: every skill may be in the list (held-out ones too), canonical descriptions; its own
+                # random stream, so that the chains are the same as without lists
+                lrng = random.Random(f"{seed}/listing/{len(specs)}")
+                specs[-1]["listing"] = pp.Listing.build(chain, list(pp.SKILLS), lrng, vary=False, hints=hints).to_json()
     return specs
 
 
@@ -230,7 +246,11 @@ def run_chain(
         state = pp.hands_text(rows + [rows[-1]] * (k + 1), k) if rows else None  # past the end: standing still
         return scored(planner, images, spec["goal"], running, memory.text(), state)
 
-    chain, memory = spec["chain"], pp.MemoryTracker(progress=getattr(planner, "uses_progress", False))
+    listing = pp.Listing(spec["listing"]) if getattr(planner, "uses_list", False) else None
+    planner.listing = listing  # G4: the goal's skill list (letters in its prompt, memory and replies)
+    chain = spec["chain"]
+    memory = pp.MemoryTracker(progress=getattr(planner, "uses_progress", False),
+                              namer=listing.letter if listing else None)  # fmt: skip
     first = ask(by_dir[spec["episodes"][0]], 0, None)
     steps, asks = [], 1
     for i, (task, name) in enumerate(zip(chain, spec["episodes"], strict=True)):
@@ -272,14 +292,102 @@ def run_chain(
             "steps": steps, "threshold": threshold}  # fmt: skip
 
 
+def run_chain_steps(planner, data: Path, spec: dict, by_dir: dict, *, every: int, confirm: int, states=None) -> dict:
+    """run_chain for G5: the goal split once (decompose, scored against the chain), then each step replayed as in
+    run_chain with the right plan (so that the steps are scored apart from the split); a step ends after ``confirm``
+    replies in a row naming another step or done. Completed: the split right and every switch caught."""
+    from PIL import Image
+
+    past = getattr(planner, "past", pp.PAST_S)
+    chain = spec["chain"]
+    split = planner.decompose(spec["goal"])
+    memory = pp.StepTracker(progress=True)
+    steps, asks = [], 1
+    for i, (task, name) in enumerate(zip(chain, spec["episodes"], strict=True)):
+        episode = by_dir[name]
+        labels, run, switch, trace = episode["labels"], 0, None, []
+        k, still, last = 0, 0, None
+        while True:
+            frozen = k >= len(labels) + max(past)
+            text = memory.text()
+            if frozen and ((text == last and run == 0) or still >= MAX_STILL_ASKS):
+                break
+            images = [Image.open(data / path).convert("RGB") for path in held_images(episode, k, past)]
+            rows = states.get(episode["dir"]) if states else None
+            state = pp.hands_text(rows + [rows[-1]] * (k + 1), k) if rows else None
+            result = planner.step(images, chain, i + 1, text, state)
+            asks += 1
+            memory.observe(result["memory"])
+            step = result["step"]
+            trace.append([k, step, memory.progress])
+            run = run + 1 if step is not None and step != i + 1 else 0
+            if run >= confirm:
+                switch = {"frame": k, "skill": step}
+                break
+            if frozen:
+                still, last = still + 1, text
+            k += every
+        right = i + 2 if i + 1 < len(chain) else pp.DONE
+        if switch is None:
+            outcome = "missed"
+        elif labels[min(switch["frame"], len(labels) - 1)] == 0:
+            outcome = "early"
+        elif switch["skill"] != right:
+            outcome = "wrong"
+        else:
+            outcome = "caught"
+        finish = labels.index(1)
+        steps.append({"task": task, "episode": name, "outcome": outcome, "switch": switch, "finished_at": finish,
+                      "delay_s": switch["frame"] - finish if switch else None, "trace": trace})  # fmt: skip
+        memory.finish(task)
+    plan_ok = split["plan"] == chain
+    monitor = all(s["outcome"] == "caught" for s in steps)
+    return {"chain": chain, "goal": spec["goal"], "plan": split["plan"], "plan_reply": split["reply"],
+            "plan_ok": plan_ok, "start_ok": bool(split["plan"]) and split["plan"][0] == chain[0],
+            "start": split["plan"][0] if split["plan"] else None, "completed": plan_ok and monitor,
+            "monitor_completed": monitor, "asks": asks, "steps": steps, "threshold": None}  # fmt: skip
+
+
+def decompose_report(planner, n: int, seed: int) -> str:
+    """G5's split alone, on goals never seen: random plans (repeats in a row too) in held-out wordings ("eval" purpose
+    words and count templates), and in G2's named wordings; exact plans per kind of goal."""
+    rng = random.Random(f"{seed}/decompose")
+    rows = collections.defaultdict(lambda: [0, 0])
+    misses = []
+    for i in range(n):
+        chain = pp.repeat_chain(rng, repeat=0.35)
+        kind = "eval" if i % 2 else "named"
+        goal = pp.step_goal_text(chain, rng, split="eval") if kind == "eval" else pp.any_goal_text(chain, rng)
+        if kind == "named" and len(pp.runs_of(chain)) != len(chain):
+            goal = pp.step_goal_text(chain, rng, split="train", purpose=0.0)  # named skills with counts
+            kind = "named+count"
+        got = planner.decompose(goal)["plan"]
+        key = (kind, "有连续重复" if len(pp.runs_of(chain)) != len(chain) else "无连续重复")
+        rows[key][0] += got == chain
+        rows[key][1] += 1
+        if got != chain and len(misses) < 12:
+            misses.append(f"- {goal} → {got}（应为 {chain}）")  # noqa: RUF001
+    lines = ["# G5 拆任务（只看文字，没见过的说法）", "", "| 说法 | 连续重复 | 拆对 |", "|---|---|---|"]
+    for (kind, rep), (ok, total) in sorted(rows.items()):
+        lines.append(f"| {kind} | {rep} | {ok}/{total} |")
+    return "\n".join(lines + ["", "拆错的例子：", *misses]) + "\n"
+
+
 def chain_report(records: list[dict], every: int, confirm: int, name: str) -> str:
-    """Goals completed per length, then every switch by outcome, overall and per running skill."""
+    """Goals completed per length, then every switch by outcome, overall and per running skill. G5 (plan_ok in the
+    records): also the plans split right and the goals the steps alone completed (with the right plan given)."""
+    g5 = bool(records) and "plan_ok" in records[0]
     lines = [f"# 整链闭环重放（{name}，每 {every} 秒问一次，连续 {confirm} 次才切）", "",  # noqa: RUF001
-             "| 链长 | 整链做完 | 开头选对 |", "|---|---|---|"]  # fmt: skip
+             "| 链长 | 整链做完 | 开头选对 |" + (" 拆对 | 只看执行（计划给对）|" if g5 else ""),
+             "|---|---|---|" + ("---|---|" if g5 else "")]  # fmt: skip
     for length in sorted({len(r["chain"]) for r in records}):
         group = [r for r in records if len(r["chain"]) == length]
         done, start = sum(r["completed"] for r in group), sum(r["start_ok"] for r in group)
-        lines.append(f"| {length} | {done}/{len(group)} ({done / len(group):.0%}) | {start}/{len(group)} |")
+        extra = ""
+        if g5:
+            extra = (f" {sum(r['plan_ok'] for r in group)}/{len(group)} |"
+                     f" {sum(r['monitor_completed'] for r in group)}/{len(group)} |")  # fmt: skip
+        lines.append(f"| {length} | {done}/{len(group)} ({done / len(group):.0%}) | {start}/{len(group)} |{extra}")
     steps = [s for r in records for s in r["steps"]]
     lines += [
         "",
@@ -401,6 +509,10 @@ def main() -> None:
                         "show them, or always say unknown")  # fmt: skip
     parser.add_argument("--threshold", type=float, default=None, help="--chains: switch when the running skill's p is "
                         "below this (planner_runtime.plan_scored), not on the greedy reply")  # fmt: skip
+    parser.add_argument("--goal-style", choices=("named", "abstract", "count"), default="named",
+                        help="--chains: goals naming the skills, (G3) purpose words held out of training, or (G5) "
+                        "repeats in a row with counts in held-out wordings")  # fmt: skip
+    parser.add_argument("--decompose", type=int, default=0, help="G5: only the split, on this many unseen goals")
     parser.add_argument("--chains", type=int, default=0, help="closed-loop goals of each length in CHAIN_LENGTHS "
                         "(run_chain), asked every --every seconds with --confirm; writes <out>/chains*.md")  # fmt: skip
     args = parser.parse_args()
@@ -421,12 +533,21 @@ def main() -> None:
         Path(args.adapter).expanduser() / "eval" if args.adapter not in ("base", "") else data / "eval_base"
     )  # fmt: skip
     out.mkdir(parents=True, exist_ok=True)
+    if args.decompose:
+        planner = Planner(args.adapter, **({"base": args.base} if args.base else {}), device=args.device)
+        text = decompose_report(planner, args.decompose, args.seed)
+        (out / "decompose.md").write_text(text)
+        print(text, flush=True)
+        return
     if args.chains:
         tag = f"chains_every{args.every}_confirm{args.confirm}" + (f"_t{args.threshold}" if args.threshold else "")
         path = out / f"{tag}.jsonl"
         by_dir = {e["dir"]: e for e in episodes}
         if not args.merge:
-            specs = chain_specs(held, args.seed, args.chains)
+            meta = Path(args.adapter).expanduser() / "planner.json" if args.adapter not in ("base", "") else None
+            info = json.loads(meta.read_text()) if meta and meta.is_file() else {}
+            specs = chain_specs(held, args.seed, args.chains, goal_style=args.goal_style, listing=bool(info.get("list")),
+                                hints=bool(info.get("hints")))
             if args.shard:
                 k, n = (int(v) for v in args.shard.split("/"))
                 specs, path = specs[k::n], path.with_suffix(f".shard{k}.jsonl")
@@ -436,8 +557,12 @@ def main() -> None:
                 states = json.loads((data / "states.json").read_text())
             with path.open("w") as f:
                 for i, spec in enumerate(specs, 1):
-                    record = run_chain(planner, data, spec, by_dir, every=args.every, confirm=args.confirm,
-                                       states=states, threshold=args.threshold)  # fmt: skip
+                    if getattr(planner, "uses_steps", False):
+                        record = run_chain_steps(planner, data, spec, by_dir, every=args.every, confirm=args.confirm,
+                                                 states=states)  # fmt: skip
+                    else:
+                        record = run_chain(planner, data, spec, by_dir, every=args.every, confirm=args.confirm,
+                                           states=states, threshold=args.threshold)  # fmt: skip
                     f.write(json.dumps(record, ensure_ascii=False) + "\n")
                     f.flush()
                     print(f"{i}/{len(specs)} {len(spec['chain'])} skills: "

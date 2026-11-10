@@ -3,7 +3,11 @@ reply per line on stdout. Runs under the planner's interpreter (venvs/planner, s
 
     {"cmd": "info"}                                   -> {"ok": true, "info": {...}}
     {"cmd": "plan", "images_path": <npz: image_0..image_5, HWC uint8 RGB: cam_high, cam_left_wrist, cam_right_wrist
-     now, cam_high 3, 2, 1 s ago>, "goal": str, "running": str | null, "memory": str, "skills": [str]}
+     now, cam_high 3, 2, 1 s ago>, "goal": str, "running": str | null, "memory": str, "skills": [str],
+     "listing": [[letter, task, description], ...] | null (a list planner, G4: running a task, memory in letters)}
+    {"cmd": "decompose", "goal": str}                 -> G5: {"ok": true, "plan": [task, ...] | null, "reply": str}
+    {"cmd": "step", "images_path": ..., "plan": [task, ...], "running": int, "memory": str}
+                                                      -> G5: {"ok": true, "step": int | "done" | null, "memory": ...}
                                                       -> {"ok": true, "skill": str | null, "memory": str | null,
                                                           "reply": str, "infer_s": float}
 """
@@ -15,6 +19,7 @@ import contextlib
 import json
 import os
 from pathlib import Path
+import random
 import sys
 
 import numpy as np
@@ -38,8 +43,14 @@ def main() -> None:
     stdout = os.fdopen(os.dup(1), "w", buffering=1)
     os.dup2(2, 1)
     planner = Planner(args.adapter, base=args.base, device=args.device)
+    if planner.uses_list:  # warm-up list (G4); each request brings its goal's list
+        planner.listing = pp.Listing.build([], list(pp.SKILLS), random.Random(0), vary=False, size=len(pp.SKILLS))
     blank = planner_image(np.full((480, 640, 3), 128, np.uint8))
-    _skill, _memory, _reply, took = planner.plan([blank] * 6, "warm up", None, pp.NO_MEMORY)  # kernels compile here
+    if getattr(planner, "uses_steps", False):  # G5: both questions once
+        planner.decompose("按铃")
+        took = planner.step([blank] * (3 + len(planner.past)), ["click_bell"], 1, pp.step_memory(0, 0))["seconds"]
+    else:
+        _skill, _memory, _reply, took = planner.plan([blank] * 6, "warm up", None, pp.NO_MEMORY)  # kernels compile
     print(f"[planner] ready ({took:.1f} s warm-up): {json.dumps(planner.info())}", file=sys.stderr, flush=True)
     for line in sys.stdin:
         if not line.strip():
@@ -48,10 +59,21 @@ def main() -> None:
             request = json.loads(line)
             if request["cmd"] == "info":
                 reply = {"ok": True, "info": planner.info()}
+            elif request["cmd"] == "decompose":  # G5: the goal's plan
+                result = planner.decompose(request["goal"])
+                reply = {"ok": True, "plan": result["plan"], "reply": result["reply"], "infer_s": result["seconds"]}
+            elif request["cmd"] == "step":  # G5: keep the running step, the next one, or done
+                with np.load(request["images_path"]) as data:
+                    images = [planner_image(data[f"image_{k}"]) for k in range(len(data.files))]
+                result = planner.step(images, request["plan"], request["running"], request["memory"])
+                reply = {"ok": True, "step": result["step"], "memory": result["memory"], "reply": result["reply"],
+                         "infer_s": result["seconds"]}  # fmt: skip
             elif request["cmd"] == "plan":
                 with np.load(request["images_path"]) as data:
                     images = [planner_image(data[f"image_{k}"]) for k in range(len(data.files))]
                 skills = tuple(request.get("skills") or ())
+                if request.get("listing"):
+                    planner.listing = pp.Listing(request["listing"])
                 result = planner.plan_scored(
                     images,
                     request["goal"],

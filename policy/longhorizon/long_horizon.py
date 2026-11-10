@@ -22,9 +22,13 @@
 #
 # Planner mode (long_horizon_goal + long_horizon_planner), as π0.5's high-level step with MEM's memories: the goal is one
 # sentence and a vision-language model (planner_worker.py: RynnBrain1.1-2B, zero-shot or a train_planner.py adapter)
-# picks the skills. It is asked in the background after every chunk (the cameras now, the top camera 3, 2, 1 s before,
-# the running skill and its language memory); --confirm replies in a row naming another skill (or done) end the running
-# one, the memory becomes what it wrote. After an operator's n or a timeout it is asked again, nothing running, once
+# picks the skills. It is asked in the background (the cameras now, the top camera 3, 2, 1 s before, the running skill
+# and its language memory); --confirm replies in a row naming another skill (or done) end the running one, the memory
+# becomes what it wrote. Since 11-10 (planner_ask_while_moving) it is asked while the arms carry out a chunk, not in the
+# last steps before the world model's next inference (the two shared the GPU: 0.45 -> 0.7 s an inference), each reply
+# counts as soon as it is there, and once the switch is decided the rest of the chunk is dropped: on 11-10's bench a
+# finished bell waited ~40 steps (a reply read one chunk late, then a second chunk for the second vote). Off: asked
+# after every chunk, the reply read after the next (as before). After an operator's n or a timeout it is asked again, nothing running, once
 # the arms are back at the start pose (a timed-out skill is not finished: it may well pick it again).
 # ----------------------------------------------------------------------------
 
@@ -92,6 +96,10 @@ class Settings:
     planner: str = ""  # a train_planner.py adapter dir, or base (RynnBrain1.1-2B zero-shot)
     planner_confirm: int = 2  # planner replies in a row naming another skill before the running one ends
     planner_every_s: float = 3.0  # at least this long between planner asks (0: after every chunk); evaluated at 3 s
+    # ask while the chunk runs (each env step may send a question or count a reply) and end the chunk once the switch
+    # is decided; False: ask after each chunk, read the reply after the next one
+    planner_ask_while_moving: bool = True
+    planner_ask_margin_steps: int = 5  # no question in a chunk's last steps (~ the planner's time at 10 Hz)
     # > 0: a reply votes to switch when the running skill's probability (planner_runtime.plan_scored) is below this,
     # to the likeliest other skill, whatever the greedy reply says; 0: the greedy reply (eval_planner.py --threshold)
     planner_threshold: float = 0.0
@@ -118,6 +126,10 @@ class Settings:
         return settings
 
     def validate(self) -> None:
+        for name in ("planner_ask_while_moving", "return_home", "stop_when_finished"):
+            value = getattr(self, name)
+            if isinstance(value, str):  # --overrides / the web console send strings
+                setattr(self, name, value.strip().lower() not in ("0", "false", "off", "no", ""))
         if not self.tasks:
             raise ValueError("long_horizon_tasks is empty: give the subtasks in order")
         if self.on_timeout not in ON_TIMEOUT:
@@ -163,9 +175,19 @@ class StepTap:
         return getattr(self._env, name)
 
     def step(self, action):
+        if self._owner.cut_requested and "_last" in self.__dict__:  # the switch is decided: the chunk's rest is dropped
+            return self._last
         result = self._env.step(action)
+        self.__dict__["_last"] = result
         self._owner.on_policy_step(result[0])
         return result
+
+    def get_wrapper_attr(self, name):
+        """The env's, except that is_task_success reads True once the switch is decided: Phoenix's chunk loop
+        (execute_chunk, eval_async) stops there, without sending the rest."""
+        if name == "is_task_success" and self._owner.cut_requested:
+            return lambda: True
+        return self._env.get_wrapper_attr(name)
 
 
 class LongHorizonModel:
@@ -189,6 +211,10 @@ class LongHorizonModel:
         if self.detector is not None and self.detector.source == "phoenix":
             self._tap_phoenix()
         self.next_requested = threading.Event()
+        self.cut_requested = False  # planner_ask_while_moving: the switch is decided, the chunk's rest is dropped
+        self.decided: str | None = None  # the reason decided during the chunk ("planner", "operator")
+        self.chunk_steps, self.chunk_len = 0, 0  # steps of the running chunk; the longest full chunk so far
+        self.pending_ask_step = None
         self.planner, self.top_frames = None, FrameMemory(settings.control_hz)
         if settings.goal:  # the skills the adapter has a prompt for
             settings.tasks = [task for task in settings.tasks if self.prompt_of(task, self.base_args)]
@@ -271,6 +297,48 @@ class LongHorizonModel:
             if planner is not None:
                 planner.close()
         self.planner = None
+
+    def has_pending(self) -> bool:
+        return self.pending_goal is not None or self.pending_planner is not None
+
+    def take_pending_now(self) -> None:
+        """Between episodes (the web console waits for 开始): the new goal / loaded planner at once, and the last episode's
+        chain cleared from what the page shows. The caller makes sure no episode is under way."""
+        if not self.has_pending():
+            return
+        self._take_pending()
+        self.records, self.plans, self.finished, self.memory = [], [], [], None
+        if self.planner is not None:
+            self.planner.plan_tasks = None  # a step planner (G5) splits the new goal when the episode starts
+        self.phase = "ready"
+        self.preview_plan()
+
+    def preview_plan(self) -> bool:
+        """Between episodes: a step planner (G5) splits the goal now, in the background, so that the page shows its plan
+        before 开始 (11-10, user: "我每次点击应用 测试页就应该更新啊" / "难道我点开始才开始拆吗"). Once per goal and planner:
+        the web console calls it at every heartbeat while it waits for 开始 (the goal 切到长任务 started with, one 应用
+        changed, a planner swapped in). The episode's start splits it again (the same goal gives the same plan; the
+        worker's pipe is locked). True if a split was started."""
+        planner = self.planner
+        steps = bool((getattr(planner, "info", None) or {}).get("steps"))
+        if planner is None or not steps or not hasattr(planner, "begin_goal"):
+            return False
+        goal = self.settings.goal
+        if getattr(planner, "plan_goal", None) == goal or getattr(self, "previewing", None) == (planner, goal):
+            return False
+        self.previewing = (planner, goal)
+
+        def split() -> None:
+            try:
+                planner.begin_goal(goal)
+            except Exception as exc:  # noqa: BLE001 - only the page's preview is missing; 开始 splits it again
+                print(f"[long_horizon] could not split {goal!r} ahead: {exc}", flush=True)
+                return  # previewing stays: not tried again for this goal (开始 still splits it)
+            if getattr(self, "previewing", None) == (planner, goal):
+                self.previewing = None
+
+        threading.Thread(target=split, name="planner-preview", daemon=True).start()
+        return True
 
     def _take_pending(self) -> None:
         """An episode starts: the goal and planner chosen since the one before (set_goal, set_planner)."""
@@ -450,7 +518,10 @@ class LongHorizonModel:
             self._begin_subtask(obs)
             return
         self._take_pending()
-        self.mem = pp.MemoryTracker(progress=self.uses_progress)
+        begin = getattr(self.planner, "begin_goal", None)  # a list planner (G4): its skill list, memory in letters;
+        namer = begin(self.settings.goal) if begin else None  # a step planner (G5): it splits the goal here
+        steps = bool((getattr(self.planner, "info", None) or {}).get("steps"))
+        self.mem = (pp.StepTracker if steps else pp.MemoryTracker)(progress=self.uses_progress, namer=namer)
         self.memory, self.finished, self.plans = self.mem.text(), self.mem.finished, []
         self.pending_plan = None
         self.top_frames.reset()
@@ -462,12 +533,14 @@ class LongHorizonModel:
         self.top_frames.note(self.episode_steps, images["cam_high"])
         return [images[cam] for cam in CAMERAS] + self.top_frames.past(self.episode_steps, images["cam_high"])
 
-    def _log_plan(self, result: dict, running: str | None) -> None:
+    def _log_plan(self, result: dict, running: str | None, asked: int | None = None) -> None:
         probs = result.get("probs") or {}
-        self.plans.append({"step": self.episode_steps, "running": running, "skill": result["skill"],
+        self.plans.append({"step": self.episode_steps, **({"asked": asked} if asked is not None else {}),
+                           "running": running, "skill": result["skill"],
                            "memory": result["memory"], "ms": round(1000 * result["infer_s"]),
                            **({"p_run": round(probs[running], 4)} if running in probs else {}),
-                           **({"greedy": result["greedy_skill"]} if "greedy_skill" in result else {})})  # fmt: skip
+                           **({"greedy": result["greedy_skill"]} if "greedy_skill" in result else {}),
+                           **({"plan_step": result["step"]} if "step" in result else {})})  # fmt: skip
 
     def _choose_next(self, obs) -> None:
         """Ask the planner what to do, nothing running (the episode's start, or after n / a timeout); start it."""
@@ -488,29 +561,62 @@ class LongHorizonModel:
         self._begin_subtask(obs)
 
     def _consult_planner(self, obs) -> str | None:
-        """After a chunk: read the planner's reply about the chunk before (asked in the background meanwhile), then ask
-        about this one. "planner" once --planner_confirm replies in a row name another skill."""
-        future, decision = self.pending_plan, None
-        if future is not None and future.done():
-            self.pending_plan = None
-            result = self._thresholded(future.result())  # a worker error surfaces here
-            self._log_plan(result, self.task)
-            if self.uses_progress:
-                self.mem.observe(result["memory"])
-                self.memory = self.mem.text()
-            if result["skill"] is not None and result["skill"] != self.task:
-                self.plan_run, self.proposal = self.plan_run + 1, result
-            else:
-                self.plan_run = 0
-            if self.plan_run >= int(self.settings.planner_confirm):
-                decision = "planner"
+        """After a chunk. planner_ask_while_moving: the switch decided during the chunk, or a reply that came in at its
+        last step (no question here: the world model's inference comes next). Otherwise: read the reply about the chunk
+        before (asked in the background meanwhile), then ask about this one. "planner" once --planner_confirm replies in
+        a row name another skill."""
+        if self.decided is not None:
+            decision, self.decided = self.decided, None
+            return decision
+        decision = "planner" if self._take_reply() else None
+        if decision is None and not self.settings.planner_ask_while_moving:
+            self._maybe_ask(obs)
+        return decision
+
+    def _take_reply(self) -> bool:
+        """The planner's reply if it is there: logged, the memory updated, counted. True once --planner_confirm replies
+        in a row vote to switch."""
+        future = self.pending_plan
+        if future is None or not future.done():
+            return False
+        self.pending_plan = None
+        result = self._thresholded(future.result())  # a worker error surfaces here
+        self._log_plan(result, self.task, self.pending_ask_step)
+        if self.uses_progress:
+            self.mem.observe(result["memory"])
+            self.memory = self.mem.text()
+        switch = result.get("switch")  # G5: the next step can be the same skill again
+        if switch is None:
+            switch = result["skill"] is not None and result["skill"] != self.task
+        if switch:
+            self.plan_run, self.proposal = self.plan_run + 1, result
+        else:
+            self.plan_run = 0
+        return self.plan_run >= int(self.settings.planner_confirm)
+
+    def _maybe_ask(self, obs) -> None:
         since = (self.episode_steps - self.last_ask_step) / float(self.settings.control_hz)
-        if decision is None and self.pending_plan is None and since >= float(self.settings.planner_every_s):
-            self.last_ask_step = self.episode_steps
+        if self.pending_plan is None and since >= float(self.settings.planner_every_s):
+            self.last_ask_step = self.pending_ask_step = self.episode_steps
             self.pending_plan = self.planner.submit(
                 self._planner_images(obs), self.settings.goal, self.task, self.memory
             )
-        return decision
+
+    def _planner_while_moving(self, obs) -> None:
+        """planner_ask_while_moving, at every env step of a chunk: count a reply that came in (a decided switch drops
+        the chunk's rest), or ask, unless the chunk is about to end."""
+        if self.decided is not None:
+            return
+        if self.next_requested.is_set():  # the operator's n: at once, not at the chunk's end
+            self.decided, self.cut_requested = "operator", True
+            return
+        if self._take_reply():
+            self.decided, self.cut_requested = "planner", True
+            return
+        margin = int(self.settings.planner_ask_margin_steps)
+        if self.chunk_len and self.chunk_steps > self.chunk_len - margin:
+            return  # its reply would come during the world model's next inference
+        self._maybe_ask(obs)
 
     def _thresholded(self, result: dict) -> dict:
         """The reply with its skill decided by planner_threshold on the running skill's probability (if set and the
@@ -534,6 +640,7 @@ class LongHorizonModel:
         self.next_requested.clear()
         self.plan_run, self.proposal, self.pending_plan = 0, None, None
         self.last_ask_step = -(10**9)  # the first chunk of a skill is asked about at once
+        self.cut_requested, self.decided, self.chunk_steps = False, None, 0
         if self.planner is not None:  # the short-term memory starts with the skill, as in its training episodes
             self.top_frames.reset()
         self.records.append(
@@ -559,8 +666,11 @@ class LongHorizonModel:
         """Every env step the inner adapter takes (StepTap)."""
         self.episode_steps += 1
         self.subtask_steps += 1
+        self.chunk_steps += 1
         if self.planner is not None and self.top_frames.due(self.episode_steps):
             self.top_frames.note(self.episode_steps, extract_image(obs["sensor"]["cam_high"]["color"]))
+        if self.planner is not None and self.settings.planner_ask_while_moving and self.phase == "run":
+            self._planner_while_moving(obs)
         if self.tracker is not None and self.features_path is None and self.subtask_steps % self.stride == 0:
             self.pending.append((*frame_of(obs), self.stride / float(self.settings.control_hz)))
 
@@ -629,9 +739,13 @@ class LongHorizonModel:
                 self.next_task = self.proposal["skill"]
                 if not self.uses_progress:
                     self.memory = self.proposal["memory"] or self.memory  # what the planner wrote, as in MEM
-            record.update(next=self.next_task, memory=self.memory, plans=self.plans)
+            listing, plan = getattr(self.planner, "listing", None), getattr(self.planner, "plan_tasks", None)
+            record.update(next=self.next_task, memory=self.memory, plans=self.plans,
+                          **({"listing": listing.to_json()} if listing is not None else {}),
+                          **({"plan": list(plan)} if plan else {}))  # fmt: skip
             self.plans, self.pending_plan = [], None
             self.after_home = "finish" if stop or self.next_task == pp.DONE else "next"
+        self.cut_requested, self.decided = False, None
         self.phase = "home" if self.settings.return_home else "between"
         self.home_queue = None
 
@@ -710,12 +824,15 @@ class LongHorizonModel:
         else:
             tap = StepTap(env, self, self.inner_args["prompt"])
             chunk = (qpos_of(obs), self.subtask_steps, self._stall_changes())
+            self.chunk_steps = 0
             obs, info, truncated, times = self.policy.eval(tap, self.inner, obs)
+            if not self.cut_requested:
+                self.chunk_len = max(self.chunk_len, self.chunk_steps)
             if self.features_path is not None and self.tracker is not None:
                 self._take_features(*chunk)
             reason = None
-            if self.next_requested.is_set():
-                reason = "operator"
+            if self.next_requested.is_set() or self.decided == "operator":
+                reason, self.decided = "operator", None
             elif self.planner is not None:
                 reason = self._consult_planner(obs)
             elif self._detect():

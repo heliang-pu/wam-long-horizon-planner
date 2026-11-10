@@ -22,9 +22,10 @@ from policy.longhorizon import planner_prompt as pp  # noqa: E402
 BASE = Path.home() / "workspace/models/internw0/RynnBrain1.1-2B"
 
 
-def prompt_version(*, state: bool = False, progress: bool = False, past=pp.PAST_S) -> str:
+def prompt_version(*, state: bool = False, progress: bool = False, past=pp.PAST_S, listing: bool = False,
+                   steps: bool = False) -> str:
     """planner_prompt.version(): a planner is asked with the prompt it was trained on."""
-    return pp.version(state=state, progress=progress, past=past)
+    return pp.version(state=state, progress=progress, past=past, listing=listing, steps=steps)
 
 
 def planner_image(frame: np.ndarray):
@@ -47,11 +48,19 @@ def encode_prompt(
     *,
     progress: bool = False,
     past=pp.PAST_S,
+    listing=None,
+    text: str | None = None,
 ) -> dict:
-    """The planner's input: the six images, then planner_prompt.prompt_text, through the chat template with the
-    generation prompt (no thinking)."""
+    """The planner's input: the six images, then planner_prompt.prompt_text (G4: list_prompt_text with ``listing``,
+    running already a letter), through the chat template with the generation prompt (no thinking)."""
     content = [*({"type": "image", "image": image} for image in images)]
-    text = pp.prompt_text(goal, running, memory, state=state, progress=progress, past=past)
+    if text is not None:  # G5: planner_prompt.g5_prompt (plan: no images; step: the images)
+        pass
+    elif listing is not None:
+        lines = listing if isinstance(listing, str) else pp.Listing(listing).lines()
+        text = pp.list_prompt_text(goal, running, memory, lines, state=state, past=past)
+    else:
+        text = pp.prompt_text(goal, running, memory, state=state, progress=progress, past=past)
     content.append({"type": "text", "text": text})
     return processor.apply_chat_template(
         [{"role": "user", "content": content}],
@@ -74,7 +83,8 @@ class Planner:
         self.processor = AutoProcessor.from_pretrained(base)
         model = AutoModelForImageTextToText.from_pretrained(base, dtype=torch.bfloat16)
         self.adapter, self.meta, self.uses_state, self.uses_progress = None, {}, False, False
-        self.past = pp.PAST_S
+        self.past, self.uses_list, self.listing = pp.PAST_S, False, None  # G4: set listing (pp.Listing) per goal
+        self.uses_steps = False  # G5: decompose() once, then step()
         if adapter not in (None, "", "base"):
             from peft import PeftModel
 
@@ -83,7 +93,10 @@ class Planner:
             self.uses_state = bool(self.meta.get("state"))
             self.uses_progress = bool(self.meta.get("progress"))
             self.past = tuple(self.meta.get("past_s") or pp.PAST_S)
-            expected = prompt_version(state=self.uses_state, progress=self.uses_progress, past=self.past)
+            self.uses_list = bool(self.meta.get("list"))
+            self.uses_steps = bool(self.meta.get("steps"))
+            expected = prompt_version(state=self.uses_state, progress=self.uses_progress, past=self.past,
+                                      listing=self.uses_list, steps=self.uses_steps)  # fmt: skip
             if self.meta.get("prompt_version") != expected:
                 raise ValueError(
                     f"{self.adapter} was trained on prompt {self.meta.get('prompt_version')}, planner_prompt.py is now "
@@ -94,9 +107,32 @@ class Planner:
 
     def info(self) -> dict:
         return {"adapter": str(self.adapter) if self.adapter else "base",
-                "prompt_version": prompt_version(state=self.uses_state, progress=self.uses_progress, past=self.past),
+                "prompt_version": prompt_version(state=self.uses_state, progress=self.uses_progress, past=self.past,
+                                                 listing=self.uses_list, steps=self.uses_steps),
                 "step": self.meta.get("step"), "state": self.uses_state, "progress": self.uses_progress,
-                "past_s": list(self.past)}  # fmt: skip
+                "past_s": list(self.past), "list": self.uses_list, "hints": bool(self.meta.get("hints")),
+                "steps": self.uses_steps}  # fmt: skip
+
+    @torch.no_grad()
+    def _generate(self, images, text: str, max_new_tokens: int) -> str:
+        inputs = encode_prompt(self.processor, images, "", None, "", text=text).to(self.device)
+        out = self.model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
+        return self.processor.decode(out[0, inputs["input_ids"].shape[1] :], skip_special_tokens=True).strip()
+
+    def decompose(self, goal: str, max_new_tokens: int = 160) -> dict:
+        """G5's first question: the goal's plan (skills in order, repeats in a row allowed) from the text alone."""
+        started = time.monotonic()
+        reply = self._generate([], pp.plan_prompt_text(goal), max_new_tokens)
+        return {"plan": pp.parse_plan(reply), "reply": reply, "seconds": time.monotonic() - started}
+
+    def step(self, images, plan: list[str], running: int | None, memory: str, state=None,
+             max_new_tokens: int = 48) -> dict:
+        """G5's second question: keep the running step (1-based), the next one, or done."""
+        started = time.monotonic()
+        state = (state or pp.STATE_UNKNOWN) if self.uses_state else None
+        reply = self._generate(images, pp.step_prompt_text(plan, running, memory, state, past=self.past), max_new_tokens)
+        step, memory = pp.parse_step_reply(reply, len(plan))
+        return {"step": step, "memory": memory, "reply": reply, "seconds": time.monotonic() - started}
 
     @torch.no_grad()
     def plan(
@@ -145,15 +181,24 @@ class Planner:
         switch whatever the greedy reply says, a calibrated alternative to replies in a row."""
         started = time.monotonic()
         state = (state or pp.STATE_UNKNOWN) if self.uses_state else None
+        listing = self.listing if self.uses_list else None
+        if self.uses_list and listing is None:
+            raise ValueError("a list planner (G4) is asked with a skill list: set planner.listing (planner_prompt.Listing)")
         inputs = encode_prompt(
-            self.processor, images, goal, running, memory, state, progress=self.uses_progress, past=self.past
-        ).to(self.device)
+            self.processor, images, goal, listing.letter(running) if listing else running, memory, state,
+            progress=self.uses_progress, past=self.past, listing=listing.lines() if listing else None,
+        ).to(self.device)  # fmt: skip
         out = self.model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False, output_scores=True,
                                   return_dict_in_generate=True)  # fmt: skip
         generated = out.sequences[0, inputs["input_ids"].shape[1] :]
         reply = self.processor.decode(generated, skip_special_tokens=True).strip()
-        skill, new_memory = pp.parse_reply(reply, skills)
-        n_prefix, first = self.skill_tokens(skills)
+        if listing is not None:  # letters on the wire, tasks out
+            skill, new_memory = pp.parse_list_reply(reply, listing)
+            n_prefix, letters = self.skill_tokens([letter for letter, _t, _d in listing.entries])
+            first = {(listing.task(k) if k != pp.DONE else pp.DONE): v for k, v in letters.items()}
+        else:
+            skill, new_memory = pp.parse_reply(reply, skills)
+            n_prefix, first = self.skill_tokens(skills)
         prefix = self.processor.tokenizer("skill:", add_special_tokens=False)["input_ids"]
         probs = None
         if generated[:n_prefix].tolist() == prefix and len(out.scores) > n_prefix:

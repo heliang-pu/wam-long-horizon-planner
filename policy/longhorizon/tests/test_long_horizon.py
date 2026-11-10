@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import random
 import sys
+import time
 from types import SimpleNamespace
 from typing import ClassVar
 
@@ -637,6 +638,7 @@ def planner_model(monkeypatch, reply, **settings):
     args = {"policy_name": "fake", "task_name": "click_bell", "fake_prompts": PROMPTS, "fake_steps": 10}
     args.update(long_horizon_goal="先按铃，再倒水", long_horizon_planner="base", long_horizon_min_steps=0)
     args.setdefault("long_horizon_planner_every_s", 0)  # these tests ask after every chunk
+    args.setdefault("long_horizon_planner_ask_while_moving", False)  # and read the reply after the next (before 11-10)
     args.update({f"long_horizon_{k}": v for k, v in settings.items()})
     return lh.LongHorizonPolicy(policy).get_model(args), policy, FakePlanner.instances[0]
 
@@ -1167,3 +1169,381 @@ def test_each_skill_start_tells_on_skill_its_task(monkeypatch):
     env = FakeEnv()
     run(model, env, env.reset(), 8)
     assert started[:2] == ["click_bell", "water_pouring"]
+
+
+def test_abstract_goals_name_no_skill_and_keep_the_order():
+    """G3: purpose-word goals (no skill named), held-out phrasings for evaluation, and the samples' rewrite."""
+    from policy.longhorizon import add_abstract_goals as aag
+
+    rng = random.Random(0)
+    named = {w for t in pp.SKILLS for w in pp.SKILLS[t][2]}
+    for _ in range(200):
+        chain, _i = pp.any_chain("click_bell", rng)
+        goal = pp.abstract_goal_text(chain, rng, split="eval", named_share=0.0)
+        assert not any(w in goal for w in named), goal
+        parts = [next(p for p in pp.ABSTRACT[t]["eval"] if p in goal) for t in chain[:1]]
+        assert parts
+    assert set(pp.ABSTRACT) == set(pp.SKILLS)
+    for task, words in pp.ABSTRACT.items():
+        assert not set(words["train"]) & set(words["eval"]), task
+    sample = {"goal": "先按铃，最后倒水。", "chain": ["click_bell", "water_pouring"], "memory": "m"}  # noqa: RUF001
+    assert aag.rewrite(sample, random.Random(1), 0.0) is sample
+    new = aag.rewrite(sample, random.Random(1), 1.0)
+    assert new["goal_style"] == "abstract"
+    assert new["memory"] == "m"
+
+
+def test_g4_skill_list_letters_prompt_reply_and_held_out_samples():
+    """G4: a skill list of letters (shuffled, distractors), replies and memory in letters, held-out skills never in the
+    samples, and the chain specs unchanged by lists."""
+    from policy.longhorizon import build_list_samples as bls
+
+    rng = random.Random(0)
+    lst = pp.Listing.build(["click_bell", "water_pouring", "click_bell"], list(pp.SKILLS), rng, vary=False)
+    assert {t for _l, t, _d in lst.entries} >= {"click_bell", "water_pouring"}
+    letter = lst.letter("water_pouring")
+    assert pp.parse_list_reply(f"skill: {letter}\nmemory: 已完成：{lst.letter('click_bell')}。当前进度：0/4。", lst)[0] == "water_pouring"  # noqa: RUF001
+    assert pp.parse_list_reply("skill: done\nmemory: x", lst)[0] == pp.DONE
+    assert pp.parse_list_reply("skill: click_bell\nmemory: x", lst)[0] is None  # a name, not a letter
+    tracker = pp.MemoryTracker(progress=True, finished=["click_bell"], namer=lst.letter)
+    assert tracker.text() == f"已完成：{lst.letter('click_bell')}。当前进度：0/4。"  # noqa: RUF001
+    assert pp.version(progress=True, listing=True) != pp.version(progress=True)
+    held = set(pp.HELD_OUT["A"])
+    train = [t for t in pp.SKILLS if t not in held]
+    sample = {"chain": ["mixer_operating", "click_bell", "sample_loading", "water_pouring"], "index": 1,
+              "running": "click_bell", "memory": "已完成：烧杯放搅拌器并开机。当前进度：3/4。",  # noqa: RUF001
+              "target_skill": "sample_loading", "target_memory": "已完成：烧杯放搅拌器并开机；按铃。当前进度：0/4。",  # noqa: RUF001
+              "goal": "g", "images": [], "episode": "e", "frame": 0}  # fmt: skip
+    new = bls.convert(sample, held, train, random.Random(1), abstract=0.0)
+    assert not held & set(new["chain"])
+    assert new["chain"][1] == "click_bell"
+    listed = pp.Listing(new["listing"])
+    assert listed.task(new["running"]) == "click_bell"
+    assert listed.task(new["target_skill"]) == new["chain"][2]
+    assert new["memory"].startswith(f"已完成：{listed.letter(new['chain'][0])}。")  # noqa: RUF001
+    assert bls.convert({**sample, "index": 0, "running": "mixer_operating"}, held, train, random.Random(1), 0.0) is None
+    held_eps = [{"dir": f"{t}/x", "task": t, "success": True, "labels": [0, 1]} for t in pp.SKILLS]
+    plain = ep.chain_specs(held_eps, 0, 3)
+    listed_specs = ep.chain_specs(held_eps, 0, 3, listing=True)
+    assert [s["chain"] for s in plain] == [s["chain"] for s in listed_specs]
+    assert all({t for _l, t, _d in s["listing"]} >= set(s["chain"]) for s in listed_specs)
+
+
+def test_g4_done_hints_in_list_lines_and_specs_unchanged():
+    """G4 round 2: --hints puts each skill's finished look into its line; chains and letters stay those of round 1."""
+    from policy.longhorizon import build_list_samples as bls
+
+    assert set(pp.DONE_HINTS) == set(pp.SKILLS)
+    lst = pp.Listing.build(["click_bell"], list(pp.SKILLS), random.Random(0), vary=False, hints=True)
+    assert pp.DONE_HINTS["click_bell"][0] in dict((t, d) for _l, t, d in lst.entries)["click_bell"]
+    varied = pp.Listing.build(["click_bell"], list(pp.SKILLS), random.Random(0), vary=True, hints=True)
+    assert all(any(h in d for h in pp.DONE_HINTS[t]) for _l, t, d in varied.entries)
+    held_eps = [{"dir": f"{t}/x", "task": t, "success": True, "labels": [0, 1]} for t in pp.SKILLS]
+    plain = ep.chain_specs(held_eps, 0, 4, listing=True)
+    hinted = ep.chain_specs(held_eps, 0, 4, listing=True, hints=True)
+    assert [s["chain"] for s in plain] == [s["chain"] for s in hinted]
+    assert [[e[:2] for e in s["listing"]] for s in plain] == [[e[:2] for e in s["listing"]] for s in hinted]
+    sample = {"chain": ["click_bell", "water_pouring"], "index": 0, "running": "click_bell",
+              "memory": "已完成：无。当前进度：3/4。", "target_skill": "water_pouring",  # noqa: RUF001
+              "target_memory": "已完成：按铃。当前进度：0/4。", "goal": "g", "images": [], "episode": "e", "frame": 0}  # noqa: RUF001  # fmt: skip
+    new = bls.convert(sample, set(), list(pp.SKILLS), random.Random(2), 0.0, hints=True)
+    assert all(any(h in d for h in pp.DONE_HINTS[t]) for _l, t, d in new["listing"])
+
+
+def test_list_planner_on_the_bench_gets_the_robots_skills_and_a_letter_memory(monkeypatch):
+    """A G4 planner (info list) on the bench: begin_goal gives it the world model's skills as a list (the same goal, the
+    same letters; done hints if trained on them), every request carries the list, and the chain's memory is in
+    letters; the episode's records keep the list."""
+    client = object.__new__(planner.PlannerClient)
+    client.skills, client.info, client.listing = list(pp.SKILLS), {"list": True, "hints": True}, None
+    namer = client.begin_goal("先按铃，再倒水")
+    assert {t for _l, t, _d in client.listing.entries} == set(pp.SKILLS)
+    assert namer("click_bell") == client.listing.letter("click_bell")
+    assert pp.DONE_HINTS["click_bell"][0] in dict((t, d) for _l, t, d in client.listing.entries)["click_bell"]
+    again = object.__new__(planner.PlannerClient)
+    again.skills, again.info, again.listing = list(pp.SKILLS), {"list": True}, None
+    again.begin_goal("先按铃，再倒水")
+    assert [e[:2] for e in again.listing.entries] == [e[:2] for e in client.listing.entries]
+    client.info = {"list": False}
+    assert client.begin_goal("x") is None and client.listing is None
+
+    class ListPlanner(FakePlanner):
+        info: ClassVar[dict] = {"progress": True, "list": True}  # G4 planners keep progress memories
+
+        def begin_goal(self, goal):
+            self.listing = pp.Listing.build([], self.skills, random.Random(goal), vary=False, size=len(self.skills))
+            return self.listing.letter
+
+    def reply(running, memory, call):
+        if running is None:
+            return ("click_bell", memory) if call == 1 else (pp.DONE, memory)
+        return ("water_pouring", memory) if call >= 2 else (running, memory)
+
+    FakePlanner.instances = []
+    monkeypatch.setattr(lh, "PlannerClient", ListPlanner)
+    monkeypatch.setattr(ListPlanner, "reply", staticmethod(reply), raising=False)
+    args = {"policy_name": "fake", "task_name": "click_bell", "fake_prompts": PROMPTS, "fake_steps": 10,
+            "long_horizon_goal": "先按铃，再倒水", "long_horizon_planner": "base", "long_horizon_min_steps": 0,
+            "long_horizon_planner_every_s": 0, "long_horizon_planner_confirm": 1}  # fmt: skip
+    model = lh.LongHorizonPolicy(fake_policy()).get_model(args)
+    plan = FakePlanner.instances[0]
+    env = FakeEnv()
+    run(model, env, env.reset(), 4)
+    letter = plan.listing.letter("click_bell")
+    assert model.memory == pp.memory_text(["click_bell"], 0, namer=plan.listing.letter)
+    assert letter in model.memory and "按铃" not in model.memory
+    assert model.records and model.records[0]["listing"] == plan.listing.to_json()
+
+
+def test_g5_plan_and_step_samples_repeats_in_a_row_and_replay(tmp_path):
+    """G5: plans split from goals with counts (按三次铃), step samples whose repeats keep the running skill and the
+    targets right, a step tracker, and the chain replay scoring a split and the steps (a fake planner)."""
+    rng = random.Random(0)
+    for _ in range(200):
+        s = pp.plan_sample(rng)
+        assert pp.parse_plan(pp.plan_target_text(s["plan"])) == s["plan"]
+        assert 1 <= len(s["plan"]) <= pp.MAX_CHAIN
+    assert pp.runs_of(["click_bell"] * 3 + ["water_pouring"]) == [("click_bell", 3), ("water_pouring", 1)]
+    goal = pp.step_goal_text(["click_bell"] * 3, random.Random(1), counted=1.0)
+    assert any(w in goal for w in ("三", "3", "three"))
+    train = {t for ts in pp.COUNT_TEMPLATES["train"] for t in [ts]}
+    assert not train & set(pp.COUNT_TEMPLATES["eval"])
+    src = {"chain": ["water_pouring", "click_bell"], "index": 1, "running": "click_bell", "episode": "e", "frame": 3,
+           "images": [], "memory": "已完成：倒水。当前进度：3/4。", "target_skill": "done",  # noqa: RUF001
+           "target_memory": "已完成：倒水；按铃。当前进度：0/4。"}  # noqa: RUF001  # fmt: skip
+    plain = pp.step_sample(src, rng)
+    assert (plain["plan"], plain["running"], plain["target_step"]) == (["water_pouring", "click_bell"], 2, pp.DONE)
+    seen = set()
+    for seed in range(60):
+        g = pp.step_sample(src, random.Random(seed), repeats=1)
+        assert g["plan"][g["running"] - 1] == "click_bell"
+        assert g["target_step"] == pp.DONE or g["plan"][g["target_step"] - 1] == "click_bell"
+        seen.add(tuple(g["plan"]))
+    assert ("water_pouring", "click_bell", "click_bell") in seen  # the bell's end: on to the bell again
+    t = pp.StepTracker(progress=True)
+    t.observe(pp.step_memory(0, 2))
+    t.observe(pp.step_memory(0, 2))
+    t.finish("click_bell")
+    assert t.text() == pp.step_memory(1, 0)
+    assert pp.parse_step_reply("step: 2\nmemory: m", 3) == (2, "m")
+    assert pp.parse_step_reply("step: 9\nmemory: m", 3)[0] is None
+    assert pp.version(progress=True, steps=True) != pp.version(progress=True)
+
+    class StepPlanner:
+        past, uses_steps = (1,), True
+
+        def decompose(self, goal):
+            return {"plan": ["click_bell", "click_bell"], "reply": "plan: 按铃；按铃", "seconds": 0.0}
+
+        def step(self, images, plan, running, memory, state=None):
+            k = int(images[0].info.get("k", 0)) if hasattr(images[0], "info") else 0
+            return {"step": running, "memory": memory, "reply": "", "seconds": 0.0, "k": k}
+
+    for k in range(6):
+        from PIL import Image
+
+        Image.new("RGB", (4, 4)).save(tmp_path / f"{k}.jpg")
+    episode = {"dir": "click_bell/x", "labels": [0, 0, 1, 1], "frames": [f"{k}.jpg" for k in range(6)]}
+    spec = {"chain": ["click_bell", "click_bell"], "episodes": ["click_bell/x"] * 2, "goal": "按两次铃"}
+    import unittest.mock as um
+
+    with um.patch.object(ep, "held_images", lambda e, k, past: [f"{min(k, 5)}.jpg"]):
+        record = ep.run_chain_steps(StepPlanner(), tmp_path, spec, {"click_bell/x": episode}, every=1, confirm=2)
+    assert record["plan_ok"] and not record["completed"]  # the fake never moves on: both steps missed
+    assert [s["outcome"] for s in record["steps"]] == ["missed", "missed"]
+
+
+def test_step_planner_on_the_bench_splits_once_and_presses_the_bell_three_times(monkeypatch):
+    """G5 on the bench: begin_goal splits the goal (plan_tasks), between steps the plan says what comes next, and the
+    end of a bell is a switch to the bell again (按三次铃): three bell subtasks, then done."""
+    client = object.__new__(planner.PlannerClient)
+    client.skills, client.info, client.listing, client.plan_tasks = list(pp.SKILLS), {"steps": True}, None, None
+    replies = {"decompose": {"ok": True, "plan": ["click_bell"] * 3, "reply": "plan: 按铃；按铃；按铃"}}
+    monkeypatch.setattr(client, "_rpc", lambda payload: replies[payload["cmd"]] if payload["cmd"] in replies else
+                        {"ok": True, "step": payload["running"] + 1, "memory": payload["memory"], "reply": "", "infer_s": 0})  # fmt: skip
+    assert client.begin_goal("按三次铃") is None and client.plan_tasks == ["click_bell"] * 3
+    assert client.plan([], "按三次铃", None, pp.step_memory(1, 0))["skill"] == "click_bell"  # between: the plan
+    out = client.plan([np.zeros((2, 2, 3), np.uint8)], "g", "click_bell", pp.step_memory(0, 2))
+    assert out["switch"] and out["skill"] == "click_bell"  # on to step 2: the bell again
+    out = client.plan([np.zeros((2, 2, 3), np.uint8)], "g", "click_bell", pp.step_memory(2, 3))
+    assert out["switch"] and out["skill"] == pp.DONE
+    replies["decompose"] = {"ok": True, "plan": None, "reply": "?"}
+    client.begin_goal("x")
+    assert client.plan_tasks is None and client.plan([], "x", None, pp.step_memory(0, 0))["skill"] is None
+
+    class StepPlanner(FakePlanner):
+        info: ClassVar[dict] = {"progress": True, "steps": True}
+
+        def begin_goal(self, goal):
+            self.plan_tasks = ["click_bell"] * 3
+            return None
+
+        def plan(self, images, goal, running, memory):
+            self.calls.append({"running": running, "memory": memory})
+            k = pp.parse_step_memory(memory)[0]
+            if running is None:
+                skill = self.plan_tasks[k] if k < 3 else pp.DONE
+                return {"skill": skill, "memory": memory, "reply": "", "infer_s": 0.0}
+            nxt = self.plan_tasks[k + 1] if k + 1 < 3 else pp.DONE
+            return {"skill": nxt, "memory": memory, "reply": "", "infer_s": 0.0, "switch": True, "step": k + 2}
+
+    FakePlanner.instances = []
+    monkeypatch.setattr(lh, "PlannerClient", StepPlanner)
+    args = {"policy_name": "fake", "task_name": "click_bell", "fake_prompts": PROMPTS, "fake_steps": 10,
+            "long_horizon_goal": "按三次铃", "long_horizon_planner": "base", "long_horizon_min_steps": 0,
+            "long_horizon_planner_every_s": 0, "long_horizon_planner_confirm": 1}  # fmt: skip
+    model = lh.LongHorizonPolicy(fake_policy()).get_model(args)
+    env = FakeEnv()
+    obs = env.reset()
+    for _ in range(40):
+        obs = model.eval(env, obs)[0]
+        if model.phase == "finished":
+            break
+    assert model.phase == "finished"
+    assert [r["task"] for r in model.records] == ["click_bell"] * 3
+    assert [r["reason"] for r in model.records] == ["planner"] * 3
+    assert model.records[0]["plan"] == ["click_bell"] * 3
+    assert model.memory == pp.step_memory(3, 0)
+
+
+def test_planner_asked_while_moving_counts_replies_at_once_and_cuts_the_chunk(monkeypatch):
+    """11-10 (planner_ask_while_moving): questions go out during the chunk, each reply counts as soon as it is there,
+    the decided switch drops the chunk's rest (no motion sent), and no question goes out in a chunk's last steps."""
+
+    def reply(running, memory, call):
+        if running is None:
+            return ("click_bell", memory) if memory == pp.NO_MEMORY else ("water_pouring", memory)
+        if running == "click_bell":
+            return ("water_pouring", "已完成：按铃。") if call >= 6 else ("click_bell", memory)
+        return ("water_pouring", memory)
+
+    model, _policy, planner_ = planner_model(
+        monkeypatch, reply, planner_ask_while_moving=True, planner_every_s=0.2, planner_confirm=2
+    )
+    env = FakeEnv()
+    obs = run(model, env, env.reset(), 1)  # chunk 1 (10 steps, no chunk length known yet): asks at 1, 3, 5, 7, 9
+    asked = [p["asked"] for p in model.plans if p["running"] is not None]
+    assert asked == [1, 3, 5, 7, 9] and model.chunk_len == 10 and model.phase == "run"  # call 6 (water): read at 10
+    obs = run(model, env, obs, 1)  # chunk 2: call 7 (water) asked at step 11, read at 12: the second vote, cut there
+    record = model.records[0]
+    assert record["reason"] == "planner" and record["next"] == "water_pouring"
+    assert record["end_step"] == 12 and env.steps == 12  # the chunk's last 8 steps were never sent
+    assert not model.cut_requested and model.phase == "home"
+    obs = run(model, env, obs, 3)  # home, then water from the proposal; the cut is not carried over
+    assert model.task == "water_pouring" and model.phase == "run" and not model.cut_requested
+    seen, ask = [], model._maybe_ask
+
+    def spy(obs_):
+        before = model.pending_plan
+        ask(obs_)
+        if model.pending_plan is not before:
+            seen.append(model.chunk_steps)
+
+    monkeypatch.setattr(model, "_maybe_ask", spy)
+    run(model, env, obs, 4)  # water never switches: no question after a chunk's 5th step (margin 5 of 10)
+    assert seen and max(seen) <= 5
+
+
+def test_step_tap_cut_stops_phoenix_like_loops_and_sends_nothing_more(monkeypatch):
+    model, _policy, _planner = planner_model(monkeypatch, lambda running, memory, call: ("click_bell", memory))
+    env = FakeEnv()
+    obs = run(model, env, env.reset(), 1)
+    tap = lh.StepTap(env, model, "Click the bell")
+    first = tap.step(np.zeros(14, np.float32))
+    assert tap.get_wrapper_attr("is_task_success")() is False
+    model.cut_requested = True  # execute_chunk / eval_async break on is_task_success
+    assert tap.get_wrapper_attr("is_task_success")() is True
+    sent = env.steps
+    assert tap.step(np.ones(14, np.float32)) is first and env.steps == sent
+    model.cut_requested = False
+    del obs
+
+
+def test_operator_next_cuts_the_chunk_while_moving(monkeypatch):
+    model, _policy, _planner = planner_model(
+        monkeypatch,
+        lambda running, memory, call: ("click_bell", memory) if running is None else (running, memory),
+        planner_ask_while_moving=True,
+        planner_every_s=1,
+    )
+    env = FakeEnv()
+    obs = run(model, env, env.reset(), 1)
+    model.request_next()
+    run(model, env, obs, 1)  # the first step of the next chunk sees the request: the chunk ends there
+    assert model.records[0]["reason"] == "operator" and model.records[0]["end_step"] == 11
+
+
+def test_ask_while_moving_setting_from_strings():
+    base = {"task_name": "click_bell", "long_horizon_goal": "按铃", "long_horizon_planner": "base"}
+    for text, want in (("0", False), ("1", True), ("false", False), ("True", True)):
+        settings = lh.Settings.from_usr_args({**base, "long_horizon_planner_ask_while_moving": text})
+        assert settings.planner_ask_while_moving is want
+    assert lh.Settings.from_usr_args(base).planner_ask_while_moving is True
+
+
+def test_no_return_home_goes_on_from_where_the_arms_are(monkeypatch):
+    """11-10 技能之间 不回: the next skill starts at once from the pose the last one ended at (no steps sent home)."""
+
+    def reply(running, memory, call):
+        if running is None:
+            return ("click_bell", memory) if memory == pp.NO_MEMORY else ("water_pouring", memory)
+        return ("water_pouring", "已完成：按铃。") if running == "click_bell" and call >= 3 else (running, memory)
+
+    model, _policy, _planner = planner_model(monkeypatch, reply, return_home="0")
+    assert model.settings.return_home is False
+    env = FakeEnv()
+    obs = run(model, env, env.reset(), 4)  # replies read a chunk late: 3 and 4 (water) end the bell after chunk 4
+    assert model.records[0]["reason"] == "planner" and model.phase == "between"
+    ended = env.steps
+    obs = run(model, env, obs, 1)  # no way home: water starts where the bell ended, no step sent in between
+    assert model.task == "water_pouring" and model.records[1]["start_step"] == ended and env.steps == ended
+    run(model, env, obs, 1)
+    assert env.steps == ended + 10 and model.phase == "run"
+
+
+def test_take_pending_now_splits_a_step_planners_goal_ahead(monkeypatch):
+    class StepPlanner(FakePlanner):
+        info: ClassVar[dict] = {"progress": True, "steps": True}
+        plan_tasks, plan_goal = None, None
+
+        def begin_goal(self, goal):
+            self.plan_tasks, self.plan_goal = ["click_bell"] * goal.count("铃"), goal
+
+    FakePlanner.instances = []
+    monkeypatch.setattr(lh, "PlannerClient", StepPlanner)
+    args = {"policy_name": "fake", "task_name": "click_bell", "fake_prompts": PROMPTS, "fake_steps": 10,
+            "long_horizon_goal": "按铃", "long_horizon_planner": "base"}  # fmt: skip
+    model = lh.LongHorizonPolicy(fake_policy()).get_model(args)
+    model.set_goal("按铃，再按铃")
+    model.take_pending_now()
+    for _ in range(100):
+        if model.planner.plan_goal == "按铃，再按铃":
+            break
+        time.sleep(0.01)
+    assert model.settings.goal == "按铃，再按铃" and model.planner.plan_tasks == ["click_bell"] * 2
+    assert model.preview_plan() is False  # once per goal: the console's heartbeat may call it every second
+
+
+def test_preview_plan_splits_the_starting_goal_once(monkeypatch):
+    calls = []
+
+    class StepPlanner(FakePlanner):
+        info: ClassVar[dict] = {"progress": True, "steps": True}
+        plan_tasks, plan_goal = None, None
+
+        def begin_goal(self, goal):
+            calls.append(goal)
+            self.plan_tasks, self.plan_goal = ["click_bell"], goal
+
+    FakePlanner.instances = []
+    monkeypatch.setattr(lh, "PlannerClient", StepPlanner)
+    args = {"policy_name": "fake", "task_name": "click_bell", "fake_prompts": PROMPTS, "fake_steps": 10,
+            "long_horizon_goal": "请按铃", "long_horizon_planner": "base"}  # fmt: skip
+    model = lh.LongHorizonPolicy(fake_policy()).get_model(args)
+    assert model.planner.plan_tasks is None  # the goal 切到长任务 started with: not split yet
+    assert model.preview_plan() is True
+    for _ in range(100):
+        if model.planner.plan_goal == "请按铃":
+            break
+        time.sleep(0.01)
+    assert model.planner.plan_tasks == ["click_bell"] and model.preview_plan() is False and calls == ["请按铃"]
