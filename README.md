@@ -20,6 +20,36 @@
 
 ---
 
+## 演示视频（11-10 真机）
+
+![只说目的的一条：调度器自己拆成 3 步（3 倍速预览）](docs/demo_11.gif)
+
+上面是 3 倍速预览，原速视频见下表。每段画面：
+- 上方：当前子任务；
+- 中间：三个相机；
+- 右边：调度器拆分和实时日志。
+
+说明：
+- 视频按控制步 10 帧/秒播放，不含推理停顿。
+- 全部是 11-10 当天真成功的回合，没有人接管。除最后一段用 G2 外，都是 G5。
+
+| 视频 | 目标 |
+|---|---|
+| [demo_01.mp4](docs/videos/demo_01.mp4) | 请按三次铃 |
+| [demo_02.mp4](docs/videos/demo_02.mp4) | 先开抽屉放番茄，再按两次铃 |
+| [demo_03.mp4](docs/videos/demo_03.mp4) | 按铃 → 开抽屉 → 按两次铃 |
+| [demo_04.mp4](docs/videos/demo_04.mp4) | 五步连做（按铃、开抽屉、按两次铃、放笔） |
+| [demo_05.mp4](docs/videos/demo_05.mp4) | 五步连做 第二遍 |
+| [demo_06.mp4](docs/videos/demo_06.mp4) | 五步连做 第三遍 |
+| [demo_07.mp4](docs/videos/demo_07.mp4) | 按铃 → 放笔 → 插试管 |
+| [demo_08.mp4](docs/videos/demo_08.mp4) | 按铃 → 放笔 → 插试管 第二遍 |
+| [demo_09.mp4](docs/videos/demo_09.mp4) | 按铃 → 放笔 → 插试管 第三遍 |
+| [demo_10.mp4](docs/videos/demo_10.mp4) | 放笔 → 插试管 → 按铃 |
+| [demo_11.mp4](docs/videos/demo_11.mp4) | 只说目的：把试管放回去，然后把水果收进柜子，最后喊人过来 |
+| [demo_12.mp4](docs/videos/demo_12.mp4) | 先按铃再开抽屉放番茄（G2，一步一步选） |
+
+---
+
 ## 目录
 
 1. [要解决的问题](#1-要解决的问题)
