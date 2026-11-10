@@ -78,7 +78,15 @@
 
 ## 2. 架构
 
-![架构：规划器看画面和记忆选技能，十任务世界模型执行](docs/architecture.png)
+![当前架构（G5）：同一份权重先拆计划，再逐步判断，十任务世界模型执行](docs/architecture_g5.png)
+
+下面的文字框图和第 2.1–2.3 节讲的是这个架构的基础（G2：每次看画面选下一个技能）；G5 在它上面加了拆计划，见 2.5 节。G2 的原图：
+
+<details><summary>G2 架构图</summary>
+
+![G2 架构](docs/architecture.png)
+
+</details>
 
 ```
 目标句（任意组合、可重复）
