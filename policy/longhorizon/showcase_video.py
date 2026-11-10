@@ -1,4 +1,4 @@
-"""A long-horizon episode as a video to show (11-10, user: 发小红书，旁边要有日志，上面也要有当前执行的子任务).
+"""A long-horizon episode as a video to show (11-10): the cameras, the sub-task running now on top, the planner on the right.
 
 The bench's episode video (eval_result_real/long_horizon/<run>/episode_NNN*.mp4: the three cameras side by side, one
 frame per control step) with, around it:
@@ -10,7 +10,7 @@ The timeline comes from results.json (long_horizon.subtasks: start / end step, p
 at); a frame is a control step, so frame i is step i.
 
     python policy/longhorizon/showcase_video.py --run eval_result_real/long_horizon/<run> --episode 0 \
-        --out 小红书/按三次铃.mp4
+        --out demo/按三次铃.mp4
 """
 
 # ruff: noqa: RUF001, RUF002, RUF003  (the overlay text is Chinese)
